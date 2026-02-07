@@ -1,0 +1,12 @@
+[project]
+name = "nlp-rag-project"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "dotenv>=0.9.9",
+    "fastembed>=0.7.4",
+    "qdrant-client>=1.16.2",
+    "ruff>=0.15.0",
+]
