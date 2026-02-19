@@ -9,7 +9,7 @@ import os
 @dataclass
 class ConversionResults:
     """
-    Class to store the results of the conversion process
+    Dataclass to store the results of the conversion process
 
     Attributes:
         filename (str): The name of the file that was converted
@@ -67,6 +67,9 @@ class DoclingConverter:
         Args:
             text (str): The text to be processed
             separator (str): The seprator to be used for the line jumps
+
+        Returns:
+            str: The text with the useless line jumps removed
         """
         cleaned_text = re.sub(
             f"([a-zà-ÿ]){separator}[\n\r ]+{separator}([a-zà-ÿ])", r"\1 \2", text
