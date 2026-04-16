@@ -1,5 +1,5 @@
 from chonkie import RecursiveChunker, RecursiveRules, RecursiveLevel
-from convert_chunk_load.docling_converter import ConversionResults
+from data_processing.convert import ConversionResults
 from typing import Union
 from chonkie.tokenizer import TokenizerProtocol
 from dataclasses import dataclass
