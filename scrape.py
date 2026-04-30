@@ -3,18 +3,21 @@ Script de scraping Archelec depuis Internet Archive.
 
 Pipeline :
   1. Récupère les identifiants filtrés par année via l'API scrape d'IA
-  2. Pour chaque document, récupère les métadonnées + texte OCR (DjVuTXT)
-  3. Chunk → embed → insert dans Qdrant avec métadonnées enrichies
+  2. Échantillonne de façon stratifiée par département (round-robin)
+  3. Pour chaque document, récupère les métadonnées + texte OCR (DjVuTXT)
+  4. Soft-cap par parti (≤40% du total) pour éviter la surreprésentation
+  5. Chunk → embed → insert dans Qdrant avec métadonnées enrichies
 
 Usage :
-  uv run python scrape.py --years 1967 1981 --per-year 100   # 100 docs par année
-  uv run python scrape.py --years 1967 --per-year 50         # test rapide
+  uv run python scrape.py --years 1967 1981 --per-year 200
+  uv run python scrape.py --years 1967 1981 1978 --per-year 200
   uv run python scrape.py --resume                           # reprend le checkpoint
-  uv run python scrape.py --limit 10                         # scrape tout, limité
 """
 
 import argparse
 import json
+import random
+import re
 import time
 import uuid
 from collections import defaultdict
@@ -28,21 +31,56 @@ from data_processing.chunk import Chunker
 from data_processing.convert import ConversionResults
 from data_processing.embed import embedding_chunk_results
 from data_processing.load import create_collection
+from corpus.parties import normalize
 
 IA_BASE = "https://archive.org"
 IA_COLLECTION = "archiveselectoralesducevipof"
 CHECKPOINT_FILE = ".scrape_checkpoint.json"
 
+# A single party must not exceed this share of ingested docs
+MAX_PARTY_SHARE = 0.40
+
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "archelec-rag-scraper/1.0"})
 
+_DEPT_RE = re.compile(r"_L_\d{4}_\d+_([0-9A-Z]+)_")
 
-# ---------------------------------------------------------------------------
+
+def _dept_from_id(identifier: str) -> str:
+    m = _DEPT_RE.search(identifier)
+    return m.group(1) if m else "unknown"
+
+
+def stratified_sample(identifiers: list[str], n: int) -> list[str]:
+    """Round-robin across departments so every region is represented."""
+    by_dept: dict[str, list[str]] = defaultdict(list)
+    for ident in identifiers:
+        by_dept[_dept_from_id(ident)].append(ident)
+
+    # Shuffle within each dept for randomness
+    rng = random.Random(42)
+    for lst in by_dept.values():
+        rng.shuffle(lst)
+
+    # Round-robin interleave
+    result: list[str] = []
+    buckets = list(by_dept.values())
+    i = 0
+    while len(result) < n and any(buckets):
+        bucket = buckets[i % len(buckets)]
+        if bucket:
+            result.append(bucket.pop(0))
+        i += 1
+        buckets = [b for b in buckets if b] or buckets  # compact when empty
+
+    return result[:n]
+
+
+# ---
 # Internet Archive
-# ---------------------------------------------------------------------------
+# ---
 
 def fetch_identifiers(year: int | None = None) -> list[str]:
-    """Récupère les identifiants de la collection, optionnellement filtrés par année."""
     url = f"{IA_BASE}/services/search/v1/scrape"
     query = f'collection:{IA_COLLECTION} AND type:"profession de foi"'
     if year:
@@ -51,7 +89,7 @@ def fetch_identifiers(year: int | None = None) -> list[str]:
     ids: list[str] = []
 
     label = f"année {year}" if year else "toute la collection"
-    print(f"  Récupération des identifiants ({label})...", end=" ")
+    print(f"  Récupération des identifiants ({label})...", end=" ", flush=True)
     while True:
         resp = SESSION.get(url, params=params, timeout=60)
         resp.raise_for_status()
@@ -63,7 +101,6 @@ def fetch_identifiers(year: int | None = None) -> list[str]:
         params["cursor"] = cursor
         time.sleep(0.2)
 
-    # Garde uniquement les législatives (identifiant contient _L_)
     ids = [i for i in ids if "_L_" in i]
     print(f"{len(ids)} législatives trouvées.")
     return ids
@@ -80,7 +117,7 @@ def fetch_metadata(identifier: str) -> dict | None:
             if attempt == 2:
                 print(f"  ERREUR metadata {identifier}: {e}")
                 return None
-            time.sleep(2**attempt)
+            time.sleep(2 ** attempt)
     return None
 
 
@@ -98,13 +135,13 @@ def fetch_ocr(server: str, directory: str, files: list[dict]) -> tuple[str | Non
             if attempt == 2:
                 print(f"  ERREUR OCR {url}: {e}")
                 return None, None
-            time.sleep(2**attempt)
+            time.sleep(2 ** attempt)
     return None, None
 
 
-# ---------------------------------------------------------------------------
+# ---
 # Extraction des métadonnées
-# ---------------------------------------------------------------------------
+# ---
 
 def extract_fields(raw: dict) -> dict:
     fields_of_interest = {
@@ -153,9 +190,9 @@ def build_payload(identifier: str, fields: dict, ocr_url: str, pdf_url: str | No
     }
 
 
-# ---------------------------------------------------------------------------
+# ---
 # Checkpoint
-# ---------------------------------------------------------------------------
+# ---
 
 def load_checkpoint() -> set[str]:
     if Path(CHECKPOINT_FILE).exists():
@@ -169,9 +206,9 @@ def save_checkpoint(done: set[str]) -> None:
         json.dump(list(done), f)
 
 
-# ---------------------------------------------------------------------------
-# Ingestion d'une liste d'identifiants
-# ---------------------------------------------------------------------------
+# ---
+# Ingestion
+# ---
 
 def ingest_identifiers(
     identifiers: list[str],
@@ -180,20 +217,26 @@ def ingest_identifiers(
     per_year: int | None = None,
     label: str = "",
 ) -> tuple[int, int, int]:
-    """
-    Ingère une liste d'identifiants dans Qdrant.
-    Retourne (ingested, skipped, errors).
-    """
     ingested = skipped = errors = 0
-    total = len(identifiers)
     party_counts: dict[str, int] = defaultdict(int)
+    dept_counts: dict[str, int] = defaultdict(int)
 
-    for idx, identifier in enumerate(identifiers, 1):
+    # Pre-sample for department diversity
+    candidates = [i for i in identifiers if i not in done]
+    if per_year and len(candidates) > per_year * 3:
+        # Over-sample 3× then let the party soft-cap trim the rest
+        candidates = stratified_sample(candidates, per_year * 3)
+    elif per_year:
+        candidates = stratified_sample(candidates, len(candidates))
+
+    total = len(candidates)
+
+    for idx, identifier in enumerate(candidates, 1):
         if per_year and ingested >= per_year:
             break
 
         prefix = f"[{label} {idx}/{total}]" if label else f"[{idx}/{total}]"
-        print(f"{prefix} {identifier}", end=" ... ")
+        print(f"{prefix} {identifier}", end=" ... ", flush=True)
 
         meta = fetch_metadata(identifier)
         if not meta:
@@ -215,6 +258,18 @@ def ingest_identifiers(
         pdf_file = next((f for f in files if f.get("format") == "Image Container PDF"), None)
         pdf_url = f"https://{server}{directory}/{pdf_file['name']}" if pdf_file else None
 
+        fields = extract_fields(raw_metadata)
+        payload = build_payload(identifier, fields, ocr_url, pdf_url)
+
+        # Soft party cap
+        party_key = normalize(payload.get("titulaire_soutien") or "")
+        if ingested > 10:
+            share = party_counts[party_key] / ingested
+            if share > MAX_PARTY_SHARE:
+                skipped += 1
+                print(f"skip (parti {party_key} déjà {share:.0%})")
+                continue
+
         conversion = ConversionResults(filename=identifier, conversion_type="ocr", result=ocr_text)
         chunk_results = Chunker(conversion)()
         if not chunk_results.chunks:
@@ -223,8 +278,6 @@ def ingest_identifiers(
             continue
 
         embedding_results = embedding_chunk_results(chunk_results, model_name=EMBEDDING_MODEL)
-        fields = extract_fields(raw_metadata)
-        payload = build_payload(identifier, fields, ocr_url, pdf_url)
 
         client.upsert(
             collection_name=COLLECTION_NAME,
@@ -240,37 +293,36 @@ def ingest_identifiers(
 
         ingested += 1
         done.add(identifier)
-        party = payload.get("titulaire_soutien") or "inconnu"
-        party_counts[party] += 1
-        print(f"{len(chunk_results.chunks)} chunks  [{party}]")
+        party_counts[party_key] += 1
+        dept_counts[payload.get("departement_nom") or _dept_from_id(identifier)] += 1
+        print(f"{len(chunk_results.chunks)} chunks  [{party_key} | {payload.get('departement_nom', '?')}]")
 
         if ingested % 50 == 0:
             save_checkpoint(done)
+            print(f"\n  → Partis: { {k: v for k, v in sorted(party_counts.items(), key=lambda x: -x[1])[:5]} }")
+            print(f"  → Depts ({len(dept_counts)} différents)\n")
 
         time.sleep(0.3)
 
-    if party_counts:
-        print(f"  → Partis représentés :")
-        for party, count in sorted(party_counts.items(), key=lambda x: -x[1])[:10]:
-            print(f"     {count:3d}  {party}")
+    print(f"\n  Partis représentés :")
+    for party, count in sorted(party_counts.items(), key=lambda x: -x[1]):
+        pct = count / ingested * 100 if ingested else 0
+        print(f"     {count:3d} ({pct:4.1f}%)  {party}")
+    print(f"  Départements couverts : {len(dept_counts)}")
 
     return ingested, skipped, errors
 
 
-# ---------------------------------------------------------------------------
+# ---
 # Main
-# ---------------------------------------------------------------------------
+# ---
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Scrape Archelec (Internet Archive) → Qdrant")
-    parser.add_argument("--years", type=int, nargs="+", default=None,
-                        help="Années à ingérer (ex: --years 1967 1981)")
-    parser.add_argument("--per-year", type=int, default=None,
-                        help="Nombre max de documents par année (ex: --per-year 100)")
-    parser.add_argument("--limit", type=int, default=None,
-                        help="Limite globale (sans filtre année)")
-    parser.add_argument("--resume", action="store_true",
-                        help="Reprend depuis le dernier checkpoint")
+    parser.add_argument("--years", type=int, nargs="+", default=None)
+    parser.add_argument("--per-year", type=int, default=None)
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
 
     client = get_qdrant_client()
@@ -284,25 +336,24 @@ def main() -> None:
 
     if args.years:
         for year in args.years:
-            print(f"\n── Année {year} ──────────────────────────────")
+            print(f"\nannée {year}")
             ids = fetch_identifiers(year=year)
-            ids = [i for i in ids if i not in done]
             i, s, e = ingest_identifiers(ids, client, done, per_year=args.per_year, label=str(year))
             total_ingested += i
             total_skipped += s
             total_errors += e
-            print(f"  {i} ingérés, {s} sans OCR, {e} erreurs")
+            print(f"  {i} ingérés, {s} ignorés, {e} erreurs")
     else:
-        print("\n── Toute la collection ──────────────────────")
+        print("\ncollection complète")
         ids = fetch_identifiers()
-        ids = [i for i in ids if i not in done]
         if args.limit:
             ids = ids[: args.limit]
-        total_ingested, total_skipped, total_errors = ingest_identifiers(ids, client, done)
+        total_ingested, total_skipped, total_errors = ingest_identifiers(
+            ids, client, done, per_year=args.per_year
+        )
 
     save_checkpoint(done)
-    print(f"\n{'═'*50}")
-    print(f"Total : {total_ingested} ingérés, {total_skipped} sans OCR, {total_errors} erreurs.")
+    print(f"\ntotal : {total_ingested} ingérés, {total_skipped} ignorés, {total_errors} erreurs.")
 
 
 if __name__ == "__main__":

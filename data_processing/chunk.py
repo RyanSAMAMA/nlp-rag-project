@@ -100,3 +100,27 @@ class Chunker:
             chunking_method=self.chunking_method,
             chunks=chunks,
         )
+
+
+class FixedSizeChunker:
+    """Split plain text into fixed-size character chunks with optional overlap."""
+
+    def __init__(self, chunk_size: int = 512, overlap: int = 0, min_chars: int = 48):
+        self.chunk_size = chunk_size
+        self.overlap = overlap
+        self.min_chars = min_chars
+
+    def chunk(self, text: str, doc_id: str = "") -> ChunkResults:
+        chunks = []
+        step = max(1, self.chunk_size - self.overlap)
+        start = 0
+        while start < len(text):
+            piece = text[start : start + self.chunk_size].strip()
+            if len(piece) >= self.min_chars:
+                chunks.append(piece)
+            start += step
+        return ChunkResults(
+            filename=doc_id,
+            chunking_method=f"fixed_{self.chunk_size}",
+            chunks=chunks,
+        )

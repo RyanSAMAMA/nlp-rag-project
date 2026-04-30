@@ -57,7 +57,7 @@ def retrieve(
     return [
         RetrievalResult(
             chunk=point.payload["chunk"],
-            filename=point.payload.get("filename") or point.payload.get("id", "unknown"),
+            filename=point.payload.get("id") or point.payload.get("filename") or "unknown",
             score=point.score,
             annee=point.payload.get("annee"),
             parti=point.payload.get("titulaire_soutien"),

@@ -21,7 +21,7 @@ Structure ta réponse en trois parties :
 Cite des passages précis pour illustrer chaque point."""
 
 
-def generate(query: str, results: list[RetrievalResult]) -> str:
+def generate(query: str, results: list[RetrievalResult], model: str = MODEL) -> str:
     if not os.environ.get("OPENAI_API_KEY"):
         raise EnvironmentError("OPENAI_API_KEY n'est pas définie dans le .env")
 
@@ -32,7 +32,7 @@ def generate(query: str, results: list[RetrievalResult]) -> str:
 
     client = OpenAI()
     response = client.chat.completions.create(
-        model=MODEL,
+        model=model,
         max_tokens=1024,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
