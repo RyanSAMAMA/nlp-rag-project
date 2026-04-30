@@ -2,6 +2,7 @@
 Generate evaluation benchmark from the Archelec Qdrant corpus.
 Samples document chunks by year and uses GPT to produce question/answer pairs.
 """
+
 import json
 import os
 import random
@@ -52,12 +53,14 @@ Réponds UNIQUEMENT avec un tableau JSON valide, sans markdown :
 def _scroll_by_year(client, collection_name: str, annee: str, limit: int) -> list[dict]:
     records, _ = client.scroll(
         collection_name=collection_name,
-        scroll_filter=Filter(must=[FieldCondition(key="annee", match=MatchValue(value=annee))]),
+        scroll_filter=Filter(
+            must=[FieldCondition(key="annee", match=MatchValue(value=annee))]
+        ),
         limit=limit * 3,
         with_payload=True,
         with_vectors=False,
     )
-    # keep chunks with enough content
+    # garder les chunks long
     rich = [r for r in records if len(r.payload.get("chunk", "")) >= 150]
     random.shuffle(rich)
     return rich[:limit]
@@ -86,7 +89,7 @@ def _generate_qs(openai_client: OpenAI, doc: dict, n: int) -> list[dict]:
             messages=[{"role": "user", "content": prompt}],
         )
         raw = resp.choices[0].message.content.strip()
-        # strip possible markdown fences
+        # strip
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):
@@ -120,7 +123,10 @@ def generate_benchmark(
 
         for i, rec in enumerate(records):
             payload = rec.payload
-            print(f"  [{i+1}/{len(records)}] {payload.get('filename', '?')[:50]}…", end=" ")
+            print(
+                f"  [{i + 1}/{len(records)}] {payload.get('filename', '?')[:50]}…",
+                end=" ",
+            )
 
             qs = _generate_qs(openai_client, payload, questions_per_doc)
             print(f"{len(qs)} questions")
@@ -148,7 +154,7 @@ def generate_benchmark(
     with open(BENCHMARK_PATH, "w", encoding="utf-8") as f:
         json.dump(benchmark, f, ensure_ascii=False, indent=2)
 
-    print(f"\n✓ {len(benchmark)} questions saved → {BENCHMARK_PATH}")
+    print(f"\n{len(benchmark)} questions saved at {BENCHMARK_PATH}")
     return benchmark
 
 
